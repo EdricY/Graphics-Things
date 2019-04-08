@@ -1,0 +1,461 @@
+<style>
+body {
+    display: flex;
+    justify-content: center;
+}
+#canvas {
+    margin: auto;
+}
+</style>
+<canvas id="canvas" width="512" height="512"></canvas>
+
+<script>
+var default_scene = {
+    camera: {
+        eye: [0, 0, 1],
+        center: [0, 0, 0],
+        up: [0, 1, 0],
+        width: 1.0,
+        height: 1.0,
+        dist: 1.0
+    },
+    resolution_width: 512,
+    resolution_height: 512,
+    pixel_samples: 1,
+    background: [0.2,0.2,0.2],
+    ambient: [0.2,0.2,0.2],
+}
+
+function setUnsetProperties(obj, default_obj) {
+    for (let key in default_obj) {
+        if (!obj.hasOwnProperty(key)){ // key on default_obj but not on obj
+            obj[key] = default_obj[key]
+        }
+        else if (typeof default_obj[key] == 'object' && typeof obj[key] == 'object') {
+            setUnsetProperties(obj[key], default_obj[key]);
+        }
+    }
+}
+
+function arr2pt(a) {
+    if (!a) return null; 
+    return new Point(a[0], a[1], a[2]);
+}
+function arr2vec(a) {
+    if (!a) return null; 
+    return new Vector(a[0], a[1], a[2]);
+}
+
+function constructSceneObject(objectType, object) {
+    if (objectType === 'camera') {
+        let camera = object;
+        camera.eye = arr2pt(camera.eye)
+        camera.center = arr2pt(camera.center)
+        camera.up = arr2vec(camera.up)
+        camera.frame = lookat(camera.eye, camera.center, camera.up)
+        return camera;
+    } else if (objectType === 'surfaces') {
+        for (let i in object) {
+            object[i] = constructSceneObject('surface', object[i])
+        }
+        return object;
+    } else if (objectType === 'lights') {
+        for (let i in object) {
+            object[i] = constructSceneObject('light', object[i])
+        }
+        return object;
+    } else if (objectType === 'surface') {
+        let surf = object;
+        surf.frame = constructSceneObject('frame', surf.frame);
+        surf.radius = surf.radius ? surf.radius : 1.0;
+        surf.is_quad = surf.is_quad ? surf.is_quad : false;
+        surf.material = constructSceneObject('material', surf.material);
+        return surf;
+    } else if (objectType === 'material') {
+        let mat = object
+        mat.kd = arr2vec(mat.kd);
+        mat.ks = arr2vec(mat.ks);
+        mat.kr = arr2vec(mat.kr);
+        mat.n = mat.n != null ? mat.n : 10;
+        return mat;
+    } else if (objectType === 'light') {
+        let light = object;
+        light.frame = constructSceneObject('frame', light.frame);
+        light.intensity = arr2pt(light.intensity);
+        light.is_point = light.is_point != null ? light.is_point : true;
+        return light;
+    } else if (objectType === 'frame') {
+        if (object == null) {
+            return new Frame();
+        }
+        let o = arr2pt(object.o);
+        let x = arr2vec(object.x);
+        let y = arr2vec(object.y);
+        let z = arr2vec(object.z);
+        return new Frame(o, x, y, z);
+    } else if (objectType === 'ambient' || objectType === 'background') {
+        return arr2pt(object);
+    } else {
+        return object;
+    }
+}
+
+function parseSceneData(data) {
+    data = JSON.parse(data);
+    setUnsetProperties(data, default_scene);
+    for (let key in data) {
+        data[key] = constructSceneObject(key, data[key]);
+    }
+    return data
+}
+
+var xhr = new XMLHttpRequest();
+xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4 && xhr.status === 200) {
+        scene_data = parseSceneData(xhr.responseText);
+        canvas.width = scene_data.resolution_width;
+        canvas.height = scene_data.resolution_height;
+        W = canvas.width
+        H = canvas.height
+        ctx.fillStyle = "pink";
+        ctx.fillRect(0, 0, W, H);
+
+        raytrace(scene_data)
+    }
+};
+xhr.open('GET', 'scene-data.json')
+xhr.send()
+
+var canvas = document.getElementById('canvas')
+var ctx = canvas.getContext('2d');
+function raytrace(scene) {
+    let startTime = Date.now();
+    let numSamples = scene.pixel_samples
+    let antialias = numSamples > 1
+    if (!antialias) {
+        for (let r = 0; r < scene.resolution_height; r++) {
+            for (let c = 0; c < scene.resolution_width; c++) {
+                let ray = getRayForPixelCenter(scene, r, c)
+                setPixel(c, r, irradiance(scene, ray))
+            }
+        }
+    } else {
+        for (let r = 0; r < scene.resolution_height; r++) {
+            for (let c = 0; c < scene.resolution_width; c++) {
+                let color = new Point(0,0,0);
+                for (let rr = 0; rr < numSamples; rr++) {
+                    for (let cc = 0; cc < numSamples; cc++) {
+                        let u = (c + (cc+.5)/numSamples) / (scene.resolution_width)
+                        let v = 1 - (r + (rr+.5)/numSamples) / (scene.resolution_height)
+                        let ray = generateRay(scene, u, v)
+                        color = color.plus(irradiance(scene, ray));
+                    }
+                }
+                color = color.times(1/(numSamples**2));
+                setPixel(c, r, color);
+            }
+        }
+    }
+    console.log((Date.now() - startTime)/1000)
+}
+
+function generateRay(scene, u, v) {
+    let o = scene.camera.frame.o
+    let x = scene.camera.frame.x
+    let y = scene.camera.frame.y
+    let z = scene.camera.frame.z
+    let w = scene.camera.width
+    let h = scene.camera.height
+    let d = scene.camera.dist
+    let q = o
+    q = q.plus(x.times((u-0.5) * w))
+    q = q.plus(y.times((v-0.5) * h))
+    q = q.minus(z.times(d))
+    return from_through(o, q)
+}
+
+function getRayForPixelCenter(scene, row, col) {
+    let u = (col + .5) / scene.resolution_width;
+    let v = 1 - (row + .5) / scene.resolution_height;
+    return generateRay(scene, u, v)
+}
+
+function irradiance (scene, ray, call_depth=0) {
+    let backColor = scene.background;
+    let intersection = intersect(scene, ray);
+    if (!intersection) return backColor;
+    
+    let ambient = scene.ambient;
+    let kd = intersection.mat.kd;
+    let ks = intersection.mat.ks;
+    let final_color = vecTimes(ambient, kd);
+    for (light of scene.lights) {
+        if (light.is_point) {
+            let p = intersection.frame.o;
+            let s = light.frame.o;
+            let vec_to_light = s.minus(p);
+            let ray_to_light = from_through(p, s);
+            ray_to_light.max = vec_to_light.length();
+            let shadow_intersection = intersect(scene, ray_to_light)
+            if (shadow_intersection) {
+                continue;
+            }
+            let l_response = light.intensity.times(1/vec_to_light.length_squared())
+            let l_direction = vec_to_light.normalize();
+            let n = intersection.frame.z;
+            let h = ray_to_light.d.minus(ray.d).normalize();
+            let mat_n = intersection.mat.n;
+            let temp = kd.plus(ks.times(Math.max(0, n.dot(h)) ** mat_n))
+            temp = vecTimes(l_response, temp)
+            temp = temp.times(Math.max(n.dot(l_direction), 0))
+            final_color = final_color.plus(temp);
+        } else {
+            console.log('directional light not implemented');
+        }
+    }
+    let kr = intersection.mat.kr;
+    let do_refl = call_depth < 2 && kr && (kr.x != 0 || kr.y != 0 || kr.z != 0);
+    if (do_refl) {
+        let refl_v = ray.d.times(-1);
+        let refl_n = intersection.frame.z;
+        //-refl_v + (2*refl_v.dot(refl_n))*refl_n
+        let refl_dir = ray.d.plus(refl_n.times(2*refl_v.dot(refl_n)));
+        let refl_ray = new Ray(intersection.frame.o, refl_dir)
+        let temp = vecTimes(kr, irradiance(scene, refl_ray, call_depth + 1));
+        final_color = final_color.plus(temp);
+    }
+    return final_color
+}
+
+function intersect(scene, ray) {
+    let intersection = null;
+    for (surf of scene.surfaces) {
+        if (surf.is_quad) {
+            let d = ray.d
+            let n = surf.frame.z
+            let denom = d.dot(n)
+            if (denom == 0) continue
+            let numer = (surf.frame.o.minus(ray.e)).dot(n)
+            let t = numer / denom
+            if (!ray.valid_t(t)){
+                continue;
+            }
+            let f = surf.frame
+            let p = ray.eval(t)
+            let local_p = f.w2l_point(p)
+            let x_dist = Math.abs(local_p.x)
+            let y_dist = Math.abs(local_p.y)
+            if (x_dist >= surf.radius || y_dist >= surf.radius) {
+                continue;
+            }
+            if (intersection == null || t <= intersection.ray_t) {
+                frame = new Frame(p, f.x, f.y, f.z)
+                mat = surf.material
+                intersection = new Intersection(t, frame, mat)
+            }
+        } else {
+            let b = 2 * ray.d.dot(ray.e.minus(surf.frame.o));
+            let c = ray.e.minus(surf.frame.o).length_squared() - surf.radius*surf.radius;
+            let d = b*b - 4*c;
+            if (d < 0) continue;
+            let t = .5 * (-b - Math.sqrt(d))
+            if (!ray.valid_t(t)){
+                continue;
+            }
+            if (intersection == null || t <= intersection.ray_t) {
+                let p = ray.eval(t)
+                let z_ray = from_through(surf.frame.o, p)
+                let frame = new Frame(p, null, null, z_ray.d)
+                let mat = surf.material
+                intersection = new Intersection(t, frame, mat)
+            }
+        }
+    }
+    return intersection;
+}
+
+
+function setPixel(x, y, color) {
+    if (typeof color === 'string') {
+        ctx.fillStyle = color;
+    } else {
+        ctx.fillStyle = vec2Color(color);
+    } 
+    ctx.fillRect(x, y, 1, 1)
+}
+
+function rgbToHex(rgb) { 
+    let hex = Math.round(Number(rgb)).toString(16);
+    if (hex.length < 2) {
+        hex = "0" + hex;
+    } else if (hex.length > 2) {
+        hex = 'FF';
+    }
+    return hex;
+}
+
+function fullColorHex(r,g,b) {
+    let red = rgbToHex(r);
+    let green = rgbToHex(g);
+    let blue = rgbToHex(b);
+    return '#'+red+green+blue;
+}
+function vec2Color(v) {
+    return fullColorHex(v.x * 256, v.y * 256, v.z * 256);
+}
+
+function dot(v1, v2) {
+    return v1.x*v2.x + v1.y*v2.y + v1.z*v2.z;
+}
+
+function normalize(v) {
+    let lsqrd = v.x*v.x + v.y*v.y + v.z*v.z
+    let l = 0
+    if (lsqrd == 0) return v
+    if (Math.abs(lsqrd-1) < 0.0000001) l = lsqrd
+    else l = Math.sqrt(lsqrd)
+    return new Vector(v.x / l, v.y / l, v.z / l);
+}
+
+function Intersection(ray_t, frame, mat) {
+    this.ray_t = ray_t
+    this.frame = frame
+    this.mat = mat
+}
+
+function Vector(x, y, z) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    this.dot = function(vec) {
+        return dot(this, vec);
+    }
+    this.cross = function(vec){
+        ox = vec.x
+        oy = vec.y
+        oz = vec.z
+        cx = this.y*oz-this.z*oy
+        cy = this.z*ox-this.x*oz
+        cz = this.x*oy-this.y*ox
+        return new Vector(cx,cy,cz)
+    }
+
+    this.normalize = function() {
+        return normalize(this);
+    }
+
+    this.times = function(scalar) {
+        let sx = this.x * scalar;
+        let sy = this.y * scalar;
+        let sz = this.z * scalar;
+        return new Vector(sx, sy, sz);
+    }
+
+    this.length = function() {
+        return Math.sqrt(this.length_squared())
+    }
+    
+    this.length_squared = function() {
+        return this.x*this.x + this.y*this.y + this.z*this.z;
+    }
+
+    this.plus = function(pt) {
+        let nx = this.x + pt.x;
+        let ny = this.y + pt.y;
+        let nz = this.z + pt.z;
+        return new Vector(nx, ny, nz);
+    }
+    this.minus = function(pt) {
+        let nx = this.x - pt.x;
+        let ny = this.y - pt.y;
+        let nz = this.z - pt.z;
+        return new Vector(nx, ny, nz);
+    }
+}
+
+function vecTimes(v1, v2) {
+    return new Vector(
+        v1.x * v2.x,
+        v1.y * v2.y,
+        v1.z * v2.z
+    )
+}
+
+function Point(x, y, z) {
+    this.x = x
+    this.y = y
+    this.z = z
+    this.plus = function(pt) {
+        let nx = this.x + pt.x;
+        let ny = this.y + pt.y;
+        let nz = this.z + pt.z;
+        return new Vector(nx, ny, nz);
+    }
+    this.minus = function(pt) {
+        let nx = this.x - pt.x;
+        let ny = this.y - pt.y;
+        let nz = this.z - pt.z;
+        return new Vector(nx, ny, nz);
+    }
+
+    this.times = function(scalar) {
+        let sx = this.x * scalar;
+        let sy = this.y * scalar;
+        let sz = this.z * scalar;
+        return new Vector(sx, sy, sz);
+    }
+}
+
+function from_through(p1, p2) {
+    let dir = new Vector(p2.x-p1.x, p2.y-p1.y, p2.z-p1.z) 
+    dir = dir.normalize();
+    return new Ray(p1, dir);
+}
+
+function Ray(eye, dir, min=0.00005, max=Infinity) {
+    this.e = eye;
+    this.d = dir;
+    this.min = min;
+    this.max = max;
+    this.eval = function(t) {
+        return this.e.plus(this.d.times(t));
+    }
+    this.valid_t = function(t) {
+        return this.min <= t && t <= this.max;
+    }
+}
+
+
+function lookat(eye, center, up, flipped=true) {
+    let my_z = from_through(eye, center).d;
+    if (flipped) my_z = my_z.times(-1);
+    return new Frame(eye, null, up, my_z);
+}
+
+function Frame(o, x, y, z) {
+    this.o = o ? o : new Point(0,0,0);
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    //TODO: fill in x and y if only z is given.
+    let c = (x ? 1 : 0) + (y ? 1 : 0) + (z ? 1 : 0);
+    if (c === 0) {
+        this.x = new Vector(1,0,0);
+        this.y = new Vector(0,1,0);
+        this.z = new Vector(0,0,1);
+    }
+    else if (c === 2 && x == null) {
+        this.x = y.cross(z);
+    }
+
+    this.w2l_point = function(pt) {
+        pt = pt.minus(this.o);
+        let lx = this.x.dot(pt);
+        let ly = this.y.dot(pt);
+        let lz = this.z.dot(pt);
+        return new Point(lx, ly, lz);
+    }
+}
+
+
+</script>
