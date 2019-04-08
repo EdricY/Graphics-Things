@@ -7,7 +7,7 @@ Learning about image composition, gradients and whatnot.
 
 ## P02_Raytrace
 A simple raytracer.
+Implemented in Python and JavaScript.
 
-Implemented in python and JavaScript
 ![](P02_Raytrace/scenes/08_aa.png)
 
